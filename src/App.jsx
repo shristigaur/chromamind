@@ -26,6 +26,8 @@ function Header({ dark, setDark, onHistory }) {
 
 function History({ onBack }) {
   const [items, setItems] = useState(null)
+  const [serverCount, setServerCount] = useState(0)
+  const [localCount, setLocalCount] = useState(0)
   useEffect(() => {
     fetch(`${API_BASE}/api/submissions`)
       .then(r => r.json())
@@ -34,6 +36,8 @@ function History({ onBack }) {
         const localRaw = localStorage.getItem('chromamind_local_submissions')
         let localItems = []
         try { localItems = localRaw ? JSON.parse(localRaw) : [] } catch (e) { localItems = [] }
+        setServerCount((serverItems || []).length)
+        setLocalCount((localItems || []).length)
         // merge, preferring server items for same sessionId
         const map = new Map()
         ;(serverItems || []).forEach(s => map.set(s.sessionId, s))
@@ -46,16 +50,60 @@ function History({ onBack }) {
         const localRaw = localStorage.getItem('chromamind_local_submissions')
         let localItems = []
         try { localItems = localRaw ? JSON.parse(localRaw) : [] } catch (e) { localItems = [] }
+        setServerCount(0)
+        setLocalCount(localItems.length)
         setItems(localItems.sort((a,b) => new Date(b.timestamp) - new Date(a.timestamp)))
       })
+  }, [])
+  useEffect(() => {
+    let mounted = true
+    async function fetchAndMerge() {
+      try {
+        const r = await fetch(`${API_BASE}/api/submissions`)
+        const serverItems = await r.json()
+        // load local submissions (saved when user finished quiz while offline)
+        const localRaw = localStorage.getItem('chromamind_local_submissions')
+        let localItems = []
+        try { localItems = localRaw ? JSON.parse(localRaw) : [] } catch (e) { localItems = [] }
+        // merge, preferring server items for same sessionId
+        const map = new Map()
+        ;(serverItems || []).forEach(s => map.set(s.sessionId, s))
+        ;(localItems || []).forEach(s => { if (!map.has(s.sessionId)) map.set(s.sessionId, s) })
+        const merged = Array.from(map.values()).sort((a,b) => new Date(b.timestamp) - new Date(a.timestamp))
+        if (mounted) {
+          setServerCount((serverItems || []).length)
+          setLocalCount((localItems || []).length)
+          setItems(merged)
+        }
+      } catch (err) {
+        const localRaw = localStorage.getItem('chromamind_local_submissions')
+        let localItems = []
+        try { localItems = localRaw ? JSON.parse(localRaw) : [] } catch (e) { localItems = [] }
+        if (mounted) {
+          setServerCount(0)
+          setLocalCount(localItems.length)
+          setItems(localItems.sort((a,b) => new Date(b.timestamp) - new Date(a.timestamp)))
+        }
+      }
+    }
+
+    fetchAndMerge()
+    // listen for background sync events to refresh history
+    const onUpdate = () => { fetchAndMerge() }
+    window.addEventListener('chromamind:submissions:updated', onUpdate)
+    return () => { mounted = false; window.removeEventListener('chromamind:submissions:updated', onUpdate) }
   }, [])
 
   return (
     <main className="container">
       <h2>Submission History</h2>
       <p className="lead">Recent quiz results (name, age, assigned color).</p>
-      <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
+      <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
         <button className="btn ghost" onClick={onBack}>Back</button>
+        <button className="btn" onClick={() => fetchAndMerge()}>Refresh</button>
+        <div style={{ marginLeft: 8, color: '#9CA3AF', fontSize: 13 }}>
+          Server: {serverCount} • Local: {localCount}
+        </div>
         <button className="btn danger" onClick={async () => {
           if (!confirm('Clear all submissions? This will remove local and server data.')) return
           // optimistic UI
@@ -314,11 +362,20 @@ export default function App() {
 
       // Attempt to save to backend (best-effort). If successful the backend will store it;
       // we still keep the local copy so UI shows the submission immediately.
-      fetch(`${API_BASE}/api/quiz/submit`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user: { name: user.name, age: user.age }, answers: raw })
-      }).catch(() => {})
+      try {
+        // try fire-and-forget
+        fetch(`${API_BASE}/api/quiz/submit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user: { name: user.name, age: user.age }, answers: raw })
+        }).then(() => {
+          // if backend accepted, dispatch update so History can refresh
+          window.dispatchEvent(new Event('chromamind:submissions:updated'))
+        }).catch(() => {})
+      } catch (e) {}
+
+      // schedule background sync attempts in case the server is unreachable now
+      scheduleLocalSync()
 
       setProfile(profiles[assigned])
       setStage('results')
@@ -333,6 +390,49 @@ export default function App() {
   function retake() {
     start()
   }
+
+  // ---- background sync for local submissions ----
+  let syncTimer = null
+  function scheduleLocalSync() {
+    if (syncTimer) return
+    // attempt after a short delay and then every 30s
+    syncTimer = setInterval(() => attemptSyncLocalSubmissions(), 30000)
+    // also attempt immediately
+    attemptSyncLocalSubmissions()
+  }
+
+  async function attemptSyncLocalSubmissions() {
+    const raw = localStorage.getItem('chromamind_local_submissions')
+    let local = []
+    try { local = raw ? JSON.parse(raw) : [] } catch (e) { local = [] }
+    if (!local || local.length === 0) return
+    // process sequentially
+    for (const doc of [...local]) {
+      try {
+        const res = await fetch(`${API_BASE}/api/quiz/submit`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user: { name: doc.name, age: doc.age }, answers: doc.rawAnswers })
+        })
+        if (res.ok) {
+          // remove from local
+          local = local.filter(x => x.sessionId !== doc.sessionId)
+          localStorage.setItem('chromamind_local_submissions', JSON.stringify(local))
+          // notify UI
+          window.dispatchEvent(new Event('chromamind:submissions:updated'))
+        }
+      } catch (e) {
+        // network error - stop attempts for now
+        return
+      }
+    }
+  }
+
+  // attempt sync on window focus
+  useEffect(() => {
+    const onFocus = () => { attemptSyncLocalSubmissions() }
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [])
 
   return (
     <div className="app-root">

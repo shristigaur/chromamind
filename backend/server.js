@@ -3,6 +3,7 @@ import cors from 'cors'
 import dotenv from 'dotenv'
 import mongoose from 'mongoose'
 import { v4 as uuidv4 } from 'uuid'
+import path from 'path'
 
 import Submission from './models/Submission.js'
 import questions from '../src/data/questions.js'
@@ -12,6 +13,22 @@ dotenv.config()
 const app = express()
 app.use(cors())
 app.use(express.json())
+
+// Serve frontend static build if it exists (so visiting / shows the SPA)
+const distPath = path.resolve(process.cwd(), 'dist')
+try {
+  // only enable static serving if the directory exists
+  const fs = await import('fs')
+  if (fs.existsSync(distPath)) {
+    app.use(express.static(distPath))
+    // SPA fallback: serve index.html for any non-API route
+    app.get(/^\/(?!api).*/, (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'))
+    })
+  }
+} catch (e) {
+  // ignore if fs import or checks fail
+}
 
 const PORT = process.env.PORT || 5000
 let useDb = false
